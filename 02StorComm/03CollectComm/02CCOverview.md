@@ -4,9 +4,11 @@
 
 Author by: SingularityKChen
 
-!!!!!!! XCCL 是什么？
-
-本章聚焦“AI 与通信的关系”与“XCCL 基本架构”。我们将围绕**并行策略、集合通信原语、通信量与拓扑、计算/通信重叠**这一主线，解释不同并行方式为何需要 AllReduce / AllGather / All2All / Send-Recv 等原语、需要传多少数据、在真实网络与实现中如何落地，以及 XCCL 在训练框架与通信库之间的承上启下角色。
+随着深度学习模型和分布式训练规模的爆炸式增长，高效的集合通信已经成为提升训练和推理性能的关键因素之一。
+为此，业界和学术界开发了多种集合通信库，如 NVIDIA  NCCL、Huawei HCCL、Alibaba ACCL、Meta Gloo、Intel oneCCL 以及 Microsoft MSCCL 等。
+这些库针对不同硬件和应用场景进行了优化，但在架构设计上存在共性。
+本文将综述这些主流集合通信库的架构设计，抽象一个通用的 XCCL (XXXX Collective Communication Library) 模块化架构，其包括通信原语支持、调度与拓扑感知、计算通信解耦机制以及与深度学习框架的接入方式等方面。
+随后，我们将分析不同通信原语（如 AllReduce、AllGather、All-to-All、点对点 Send/Recv）在典型并行策略（数据并行、张量并行、专家并行等）下的通信量估算方法，并探讨通信开销对训练和推理效率的影响。
 
 ## AI 与通信关系
 
@@ -98,9 +100,51 @@ FSDP 前向按需 **AllGather** 权重分片，反向通过 **ReduceScatter** �
 
 XCCL（XXXX Collective Communication Library）架构源自于高性能计算（HPC）的集合通信架构，经过优化和演进，以满足当前 AI 场景的特殊通信需求。本节从 HPC 和 XCCL 通信架构对比介绍，展示二者的异同。
 
-### 计算与通信解耦
+### HPC 到 AI 通信栈基本架构
 
-!!!!!!例如下面的内容就非常粗浅，一定要学深入，多看论文，多思考。下面是我改好的。
+传统 HPC 集合通信库和 XCCL 的基本框架均可抽象为三层：适配层、集合通信业务层和集合通信平台层。
+
+适配层提供通信域管理以及集合通信算子接口。集合通信业务层实现集合通信和点对点通信的具体逻辑。集合通信平台层提供硬件资源和底层网络。
+
+在经典 HPC 中，MPI/OpenSHMEM/UCX 面向传统的高性能计算任务，通信模式以阶段性、批式居多；而在 AI 训练里，高频次的梯度同步、参数/激活的分片汇聚、token 级路由使通信更贴合模型结构。
+
+![02CCOverview11](./images/02CCOverview11.png)
+
+因此栈内自上而下发生了迁移。编程模型从 MPI 走向 NCCL/Gloo/oneCCL/MSCCL 等面向深度学习的库。通信原语以 AllReduce / AllGather / ReduceScatter / All2All / P2P 为主，与并行方式对应。拓扑结构从超算常见的 Hypercube/Dragonfly 转向更贴合深度学习训练通信场景的 Ring/Torus/分层 Fat-Tree。硬件端引入 NVLink/NVSwitch、RoCE/IB RDMA 与 NPU/TPU 特有的片内外直连，代替部分传统 PCIe 与 RoCE 通道，显著降低节点内的同步成本，同时通过分级/就近通信降低跨节点的同步成本。
+
+![03CCPrimtive01](./images/03CCPrimtive01.png)
+
+从用户视角看，XCCL 是“通信执行层”的统一入口：上承 PyTorch 与分布式控制器（Megatron-LM/MindSpeed），下接 ProcessGroup（NCCL/HCCL/Gloo…）与物理互联（RDMA、NVLink、RoCE、PCIe/CXL、SHMEM）。训练过程中，框架把张量放入 bucket，控制器在后台协调各 rank 的时序与分组，XCCL 则在独立的通信流中执行对应原语，并通过 event 与同步点把结果安全地交回计算流。这样既能充分占满节点内高带宽链路，也便于用分层/分级在跨节点时减少长尾与抖动。
+
+### XCCL 基本架构
+
+如下图 HCCL 所示，xCCL 集合通信库软件架构分为**适配层**、**集合通信业务层**和**集合通信平台层**，包含**框架适配**、**通信框架**、**通信算法**和**硬件资源交互**四个模块。
+
+![02CCOverview12](./images/02CCOverview12.png)
+
+**适配层**提供通信域管理及通信算子接口，对接 PyTorch、TensorFlow 等深度学习框架，掩盖下层实现细节。
+
+**集合通信业务层**包含通信框架与通信算法两个模块。**通信框架模块**负责通信域管理，识别和感知机器拓扑逻辑，协同通信算法模块完成最优算法选择，协同通信平台模块完成资源申请并实现集合通信任务的下发。**通信算法模块**承载集合通信算法，实现点对点通信的具体逻辑，提供特定集合通信操作的资源计算，并根据通信域信息完成通信任务编排。
+
+**集合通信平台层**提供硬件资源和底层网络，并提供集合通信的相关维护、测试能力。
+
+### 适配层：接入框架与分布式加速库
+
+!!!!!!!!! 太浅了，到底 XCCL 这些库，是如何接入 pytorch 这个框架的？代码和架构图示例，深入去学习了解。
+
+训练框架（如 PyTorch）上层接管“何时、对哪些张量、以什么粒度发起通信”，最终仍通过 `torch.distributed` 的 `ProcessGroup` 调用底层通信库（NCCL/HCCL/Gloo）：
+
+- 上层（如 DeepSpeed / Megatron-LM / ColossalAI / MindSpeed）  
+  - 负责并行策略与张量切分，组织 bucket，决定 AllReduce/AllGather/All2All/P2P 的触发时机与先后顺序。  
+  - 通过 reducer/hook 把 grad bucket 推入队列，调度后台循环线程。  
+- 中间（`PyTorch torch.distributed`）
+  - 将高层请求转为 `ProcessGroup::collective` 调用，在通信流 `xcclStreams` 上排队执行，并用 event 在计算流与通信流之间做依赖同步，确保先写后读/先聚合再使用。  
+- 底层（NCCL/HCCL/Gloo/oneCCL/MSCCL）  
+  - 依据拓扑与算法（Ring/Tree/HD/2D-Torus）完成具体的路由与搬运，并利用 GPU/NPU 的 DMA/核外执行能力与 SHARP/在网计算等优化实现高吞吐。
+
+> 加速库的加速，大多来自粒度控制（分片/bucket）、触发时机（重叠/合并）、分层通信（节点内优先）与对底层 ProcessGroup 的正确使用，而非绕开 NCCL/HCCL 另起炉灶。
+
+### 计算与通信解耦
 
 在大模型训练中，集群算力利用率（MFU）直接决定训练周期，而传统 “计算 - 通信串行” 模式是制约 MFU 的核心瓶颈。其根本问题在于强同步依赖：每一层网络计算出梯度后，必须等待该梯度通过 AllReduce 等集合通信完成跨节点同步，才能启动下一层计算。
 
@@ -118,38 +162,6 @@ XCCL（XXXX Collective Communication Library）架构源自于高性能计算（
 
 - 死锁防护：传统串行中单个节点通信阻塞会导致全集群等待（“假死锁”）；解耦后计算与通信独立，局部通信异常时，其他节点计算仍可推进，通信模块可重试容错，避免全集群挂起。
 
-### HPC 到 AI 通信栈基本架构
-
-在经典 HPC 中，MPI/OpenSHMEM/UCX 面向传统的高性能计算任务，通信模式以阶段性、批式居多；而在 AI 训练里，高频次的梯度同步、参数/激活的分片汇聚、token 级路由使通信更贴合模型结构。
-
-![02CCOverview11](./images/02CCOverview11.png)
-
-因此栈内自上而下发生了迁移。编程模型从 MPI 走向 NCCL/Gloo/oneCCL/MSCCL 等面向深度学习的库。通信原语以 AllReduce / AllGather / ReduceScatter / All2All / P2P 为主，与并行方式对应。拓扑结构从超算常见的 Hypercube/Dragonfly 转向更贴合深度学习训练通信场景的 Ring/Torus/分层 Fat-Tree。硬件端引入 NVLink/NVSwitch、RoCE/IB RDMA 与 NPU/TPU 特有的片内外直连，代替部分传统 PCIe 与 RoCE 通道，显著降低节点内的同步成本，同时通过分级/就近通信降低跨节点的同步成本。
-
-![03CCPrimtive01](./images/03CCPrimtive01.png)
-
-从用户视角看，XCCL 是“通信执行层”的统一入口：上承 PyTorch 与分布式控制器（Megatron-LM/MindSpeed），下接 ProcessGroup（NCCL/HCCL/Gloo…）与物理互联（RDMA、NVLink、RoCE、PCIe/CXL、SHMEM）。训练过程中，框架把张量放入 bucket，控制器在后台协调各 rank 的时序与分组，XCCL 则在独立的通信流中执行对应原语，并通过 event 与同步点把结果安全地交回计算流。这样既能充分占满节点内高带宽链路，也便于用分层/分级在跨节点时减少长尾与抖动。
-
-### XCCL 基本架构
-
-!!!!!!! 看代码，抽象处理 XCCL 的架构
-
-### 接入框架与分布式加速库
-
-!!!!!!!!! 太浅了，到底 XCCL 这些库，是如何接入 pytorch 这个框架的？代码和架构图示例，深入去学习了解。
-
-训练框架（如 PyTorch）上层接管“何时、对哪些张量、以什么粒度发起通信”，最终仍通过 `torch.distributed` 的 `ProcessGroup` 调用底层通信库（NCCL/HCCL/Gloo）：
-
-- 上层（如 DeepSpeed / Megatron-LM / ColossalAI / MindSpeed）  
-  - 负责并行策略与张量切分，组织 bucket，决定 AllReduce/AllGather/All2All/P2P 的触发时机与先后顺序。  
-  - 通过 reducer/hook 把 grad bucket 推入队列，调度后台循环线程。  
-- 中间（`PyTorch torch.distributed`）
-  - 将高层请求转为 `ProcessGroup::collective` 调用，在通信流 `xcclStreams` 上排队执行，并用 event 在计算流与通信流之间做依赖同步，确保先写后读/先聚合再使用。  
-- 底层（NCCL/HCCL/Gloo/oneCCL/MSCCL）  
-  - 依据拓扑与算法（Ring/Tree/HD/2D-Torus）完成具体的路由与搬运，并利用 GPU/NPU 的 DMA/核外执行能力与 SHARP/在网计算等优化实现高吞吐。
-
-> 加速库的加速，大多来自粒度控制（分片/bucket）、触发时机（重叠/合并）、分层通信（节点内优先）与对底层 ProcessGroup 的正确使用，而非绕开 NCCL/HCCL 另起炉灶。
-
 ## 总结与思考
 
 通过本章的学习，我们知道**并行方式决定原语，原语决定通信量与拓扑选择**，并说明了 XCCL 在框架调度和通信执行之间如何通过 bucket、分层与流/事件机制达成**计算-通信的高效重叠**。理解这些映射关系，是扩大模型规模、提升集群 MFU、降低网络成本的重要前提。
@@ -162,4 +174,5 @@ XCCL（XXXX Collective Communication Library）架构源自于高性能计算（
 
 ## 参考与引用
 
-!!!!!!!!参考的论文链接，自己得去看论文
+- HCCL概述 HCCL集合通信库-CANN商用版8.2.RC1开发文档-昇腾社区. Available at: https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/hccl/hcclug/hcclug_000001.html#ZH-CN_TOPIC_0000002370191085__section17991201643111 (Accessed: 13 October 2025). 
+- Weingram, A. et al. (2023) ‘XCCL: A survey of industry-led collective communication libraries for deep learning’, Journal of Computer Science and Technology, 38(1), pp. 166–195. doi:10.1007/s11390-023-2894-6. 
